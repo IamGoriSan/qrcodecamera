@@ -1,0 +1,189 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>QR 高速連続スキャナー</title>
+  <script src="https://unpkg.com/html5-qrcode"></script>
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; margin: 12px; background: #f0f2f5; color: #222; }
+    .card { max-width: 460px; margin: 0 auto 12px auto; background: #fff; padding: 14px; border-radius: 12px; box-shadow: 0 2px 8px rgba(0,0,0,0.08); }
+    #reader { width: 100%; max-width: 460px; margin: 0 auto 12px auto; background: #000; border-radius: 12px; overflow: hidden; }
+    .progress-bar-bg { width: 100%; height: 18px; background: #e9ecef; border-radius: 9px; overflow: hidden; margin: 8px 0; }
+    .progress-bar-fill { height: 100%; width: 0%; background: #28a745; transition: width 0.15s ease; }
+    .stats { display: flex; justify-content: space-between; font-weight: bold; font-size: 1.1em; }
+    .status { margin-top: 8px; padding: 8px 10px; border-radius: 6px; background: #e8f4fd; color: #0b5ed7; font-size: 0.9em; }
+    .missing-list { margin-top: 8px; padding: 8px; border-radius: 6px; background: #fff3cd; color: #664d03; font-size: 0.85em; max-height: 80px; overflow-y: auto; word-break: break-all; display: none; }
+    input, button { width: 100%; padding: 12px; margin-top: 8px; box-sizing: border-box; font-size: 1em; border-radius: 8px; border: 1px solid #ccc; }
+    button.primary { background: #198754; color: #fff; border: none; font-weight: bold; cursor: pointer; }
+    button.primary:disabled { background: #95d5b2; cursor: not-allowed; }
+    button.danger { background: #dc3545; color: #fff; border: none; margin-top: 12px; cursor: pointer; }
+  </style>
+</head>
+<body>
+
+  <div id="reader"></div>
+
+  <div class="card">
+    <div class="stats">
+      <span>読み取り進捗:</span>
+      <span id="progress-text">0 / ? (0%)</span>
+    </div>
+    <div class="progress-bar-bg">
+      <div id="progress-fill" class="progress-bar-fill"></div>
+    </div>
+    <div id="status" class="status">PCで qr_player.html を再生し、カメラをかざしてください</div>
+    <div id="missing-box" class="missing-list"></div>
+
+    <input type="text" id="filename" value="restored_file.bin" placeholder="保存するファイル名">
+    <button id="download-btn" class="primary" onclick="downloadFile()" disabled>すべて揃うと保存できます</button>
+    <button class="danger" onclick="resetAll()">すべてリセット</button>
+  </div>
+
+  <script>
+    let receivedChunks = new Map(); // index (1〜total) -> Base64文字列
+    let totalExpected = 0;
+    let isCompleted = false;
+    let audioCtx = null;
+
+    function beep(freq = 1046, duration = 0.04) {
+      try {
+        if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        const osc = audioCtx.createOscillator();
+        const gain = audioCtx.createGain();
+        osc.type = "sine";
+        osc.frequency.setValueAtTime(freq, audioCtx.currentTime);
+        gain.gain.setValueAtTime(0.15, audioCtx.currentTime);
+        osc.connect(gain);
+        gain.connect(audioCtx.destination);
+        osc.start();
+        osc.stop(audioCtx.currentTime + duration);
+      } catch (e) {}
+    }
+
+    function updateUI(msg) {
+      const count = receivedChunks.size;
+      const pct = totalExpected > 0 ? Math.floor((count / totalExpected) * 100) : 0;
+      document.getElementById("progress-text").innerText = `${count} / ${totalExpected || "?"} (${pct}%)`;
+      document.getElementById("progress-fill").style.width = `${pct}%`;
+      if (msg) document.getElementById("status").innerText = msg;
+
+      const missingBox = document.getElementById("missing-box");
+      const dlBtn = document.getElementById("download-btn");
+
+      if (totalExpected > 0 && count < totalExpected) {
+        const missing = [];
+        for (let i = 1; i <= totalExpected; i++) {
+          if (!receivedChunks.has(i)) missing.push(i);
+        }
+        // 残り30個以下になったら具体的な未読番号を表示してPC側で絞り込みやすくする
+        if (missing.length <= 30) {
+          missingBox.style.display = "block";
+          missingBox.innerText = `🔍 未読の番号 (残り${missing.length}個): ${missing.join(", ")}`;
+        } else {
+          missingBox.style.display = "none";
+        }
+        dlBtn.disabled = true;
+        dlBtn.innerText = `残り ${totalExpected - count} 個のスキャンを待機中...`;
+      } else if (totalExpected > 0 && count === totalExpected) {
+        missingBox.style.display = "none";
+        dlBtn.disabled = false;
+        dlBtn.innerText = "🎉 結合してファイルを保存";
+      }
+    }
+
+    function onScanSuccess(decodedText) {
+      // ヘッダー解析: "idx/total:filename:base64"
+      const firstColon = decodedText.indexOf(":");
+      const secondColon = decodedText.indexOf(":", firstColon + 1);
+      if (firstColon === -1 || secondColon === -1) return;
+
+      const header = decodedText.substring(0, firstColon);
+      const fname = decodedText.substring(firstColon + 1, secondColon);
+      const b64Data = decodedText.substring(secondColon + 1);
+
+      const parts = header.split("/");
+      if (parts.length !== 2) return;
+
+      const idx = parseInt(parts[0], 10);
+      const total = parseInt(parts[1], 10);
+      if (isNaN(idx) || isNaN(total) || idx < 1 || idx > total) return;
+
+      if (totalExpected === 0) {
+        totalExpected = total;
+      } else if (totalExpected !== total) {
+        return; // 別ファイルのQRが混ざった場合は無視
+      }
+
+      if (fname && document.getElementById("filename").value === "restored_file.bin") {
+        document.getElementById("filename").value = fname;
+      }
+
+      // すでに読み取り済みの番号ならスキップ
+      if (receivedChunks.has(idx)) return;
+
+      receivedChunks.set(idx, b64Data);
+      beep(987, 0.035);
+      if (navigator.vibrate) navigator.vibrate(25);
+
+      if (receivedChunks.size === totalExpected && !isCompleted) {
+        isCompleted = true;
+        beep(1318, 0.15);
+        setTimeout(() => beep(1567, 0.25), 160);
+        updateUI("✅ 全QRコードの読み取りが完了しました！自動保存します...");
+        downloadFile();
+      } else {
+        updateUI(`✅ #${idx} を取得！（あと ${totalExpected - receivedChunks.size} 個）`);
+      }
+    }
+
+    function downloadFile() {
+      if (receivedChunks.size === 0 || receivedChunks.size < totalExpected) {
+        alert("まだすべてのQRコードが揃っていません。");
+        return;
+      }
+
+      const byteArrays = [];
+      for (let i = 1; i <= totalExpected; i++) {
+        const b64 = receivedChunks.get(i);
+        const binStr = atob(b64);
+        const bytes = new Uint8Array(binStr.length);
+        for (let j = 0; j < binStr.length; j++) {
+          bytes[j] = binStr.charCodeAt(j);
+        }
+        byteArrays.push(bytes);
+      }
+
+      const blob = new Blob(byteArrays, { type: "application/octet-stream" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = document.getElementById("filename").value || "restored_file.bin";
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+    }
+
+    function resetAll() {
+      if (!confirm("読み取ったデータをリセットしますか？")) return;
+      receivedChunks.clear();
+      totalExpected = 0;
+      isCompleted = false;
+      document.getElementById("filename").value = "restored_file.bin";
+      document.getElementById("missing-box").style.display = "none";
+      updateUI("リセットしました。カメラをQRコードにかざしてください。");
+    }
+
+    const html5QrCode = new Html5Qrcode("reader");
+    html5QrCode.start(
+      { facingMode: "environment" },
+      { fps: 25, qrbox: { width: 260, height: 260 } },
+      onScanSuccess,
+      (err) => {}
+    ).catch(err => {
+      updateUI("❌ カメラの起動に失敗しました（HTTPSまたはlocalhostで開いてください）: " + err);
+    });
+  </script>
+</body>
+</html>
